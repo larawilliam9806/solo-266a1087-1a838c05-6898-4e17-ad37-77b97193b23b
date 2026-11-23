@@ -1,7 +1,7 @@
 """SQLite 持久层。
 
 所有写操作都在 ``BEGIN IMMEDIATE`` 事务里完成：解析清单、校验帧、重算、
-写库任何一步失败都会回滚，数据库保留提交前的数据。
+校验/撤下交档索引、写库任何一步失败都会回滚，数据库保留提交前的数据。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from . import coverage
+from . import coverage, delivery
 
 
 SCHEMA = """
@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS volumes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_volumes_issue ON volumes(issue_id);
+
+CREATE TABLE IF NOT EXISTS delivery_indexes (
+    issue_id     TEXT PRIMARY KEY REFERENCES issues(issue_id) ON DELETE CASCADE,
+    entries_json TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    reason       TEXT,
+    approved_at  TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 """
 
 
@@ -44,6 +53,10 @@ class StorageError(RuntimeError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+DELIVERY_STATUS_APPROVED = "approved"
+DELIVERY_STATUS_WITHDRAWN = "withdrawn"
 
 
 def utc_now() -> str:
@@ -70,6 +83,13 @@ def _stored_frames(raw: str) -> list[coverage.Frame]:
 class MissingRosterError(ValueError):
     def __init__(self) -> None:
         super().__init__("该期尚未登记版号清单，首次提交必须携带 plates")
+        self.message = str(self)
+
+
+class MissingIssueError(LookupError):
+    def __init__(self, issue_id: str) -> None:
+        super().__init__(f"该期 {issue_id!r} 尚未登记")
+        self.issue_id = issue_id
         self.message = str(self)
 
 
@@ -151,6 +171,168 @@ class Store:
             recomputed.append(code)
         return recomputed
 
+    def _volume_records(
+        self, conn: sqlite3.Connection, issue_id: str
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT volume_code, frames_json FROM volumes WHERE issue_id = ? "
+            "ORDER BY volume_code",
+            (issue_id,),
+        ).fetchall()
+        return [
+            {
+                "volume_code": row["volume_code"],
+                "frames": json.loads(row["frames_json"]),
+            }
+            for row in rows
+        ]
+
+    # -- 交档索引 -----------------------------------------------------------
+
+    def _load_index_row(
+        self, conn: sqlite3.Connection, issue_id: str
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT issue_id, entries_json, status, reason, approved_at, updated_at "
+            "FROM delivery_indexes WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+
+    def _revalidate_index_after_change(
+        self,
+        conn: sqlite3.Connection,
+        issue_id: str,
+        roster: list[str],
+        now: str,
+    ) -> str | None:
+        """卷数据/清单变化后按新数据校验已有索引。
+
+        只有仍在供档（``approved``）的索引会重新校验：
+
+        * 仍满足核定条件 -> 原样继续供档；
+        * 不再满足 -> 随本次变更撤下（``withdrawn``）。
+
+        已撤下的索引不会因数据改回而自动恢复，必须重新核定。
+        """
+
+        row = self._load_index_row(conn, issue_id)
+        if row is None:
+            return None
+        if row["status"] != DELIVERY_STATUS_APPROVED:
+            return row["status"]
+
+        entries = json.loads(row["entries_json"])
+        volumes = self._volume_records(conn, issue_id)
+        try:
+            ordered = delivery.validate_index(roster, volumes, entries)
+        except coverage.ArrangementError as exc:
+            conn.execute(
+                "UPDATE delivery_indexes SET status = ?, reason = ?, updated_at = ? "
+                "WHERE issue_id = ?",
+                (DELIVERY_STATUS_WITHDRAWN, exc.message, now, issue_id),
+            )
+            return DELIVERY_STATUS_WITHDRAWN
+        if ordered != entries:
+            # 版序调整后仍有效：只按新清单重排留档，不改变核定时间。
+            conn.execute(
+                "UPDATE delivery_indexes SET entries_json = ? WHERE issue_id = ?",
+                (_json(ordered), issue_id),
+            )
+        return DELIVERY_STATUS_APPROVED
+
+    def approve_delivery_index(self, issue_id: str, payload: Any) -> dict[str, Any]:
+        """校验并核定该期的交档索引（整期替换，全有或全无）。"""
+
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            issue_row = conn.execute(
+                "SELECT plates_json FROM issues WHERE issue_id = ?", (issue_id,)
+            ).fetchone()
+            if issue_row is None:
+                raise MissingIssueError(issue_id)
+
+            roster = json.loads(issue_row["plates_json"])
+            entries = delivery.validate_index(
+                roster, self._volume_records(conn, issue_id), payload
+            )
+
+            now = utc_now()
+            conn.execute(
+                "INSERT INTO delivery_indexes "
+                "(issue_id, entries_json, status, reason, approved_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, ?, ?) "
+                "ON CONFLICT(issue_id) DO UPDATE SET "
+                "entries_json = excluded.entries_json, "
+                "status = excluded.status, "
+                "reason = NULL, "
+                "approved_at = excluded.approved_at, "
+                "updated_at = excluded.updated_at",
+                (issue_id, _json(entries), DELIVERY_STATUS_APPROVED, now, now),
+            )
+            conn.execute("COMMIT")
+        except (coverage.ArrangementError, MissingIssueError, StorageError):
+            _rollback(conn)
+            raise
+        except sqlite3.Error as exc:
+            _rollback(conn)
+            raise StorageError(f"写入数据库失败：{exc}") from exc
+        except Exception:
+            _rollback(conn)
+            raise
+        finally:
+            conn.close()
+
+        return delivery.index_view(issue_id, entries, now, now)
+
+    def get_delivery_index(self, issue_id: str) -> dict[str, Any] | None:
+        conn = self.connect()
+        try:
+            row = self._load_index_row(conn, issue_id)
+            if row is None:
+                return None
+            return delivery.index_view(
+                issue_id,
+                json.loads(row["entries_json"]),
+                row["approved_at"],
+                row["updated_at"],
+                status=row["status"],
+                reason=row["reason"],
+            )
+        finally:
+            conn.close()
+
+    def get_delivery_index_status(self, issue_id: str) -> str | None:
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM delivery_indexes WHERE issue_id = ?", (issue_id,)
+            ).fetchone()
+            return None if row is None else row["status"]
+        finally:
+            conn.close()
+
+    def list_delivery_indexes(self) -> list[dict[str, Any]]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT issue_id, entries_json, status, reason, approved_at, updated_at "
+                "FROM delivery_indexes ORDER BY issue_id"
+            ).fetchall()
+            return [
+                delivery.index_view(
+                    row["issue_id"],
+                    json.loads(row["entries_json"]),
+                    row["approved_at"],
+                    row["updated_at"],
+                    status=row["status"],
+                    reason=row["reason"],
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
     def set_roster(self, issue_id: str, plates: list[str]) -> dict[str, Any]:
         """单独登记或更换全期清单，并重判该期所有卷（全有或全无）。"""
 
@@ -178,6 +360,10 @@ class Store:
             else:
                 recomputed = []
 
+            index_status = self._revalidate_index_after_change(
+                conn, issue_id, roster, now
+            )
+
             conn.execute("COMMIT")
         except (coverage.ArrangementError, MissingRosterError, StorageError):
             _rollback(conn)
@@ -196,6 +382,7 @@ class Store:
             "issue_created": issue_created,
             "roster_changed": roster_changed,
             "recomputed_volume_codes": recomputed,
+            "delivery_index_status": index_status,
         }
 
     def submit_volume(
@@ -269,6 +456,8 @@ class Store:
                     (_frames_to_json(frames), _json(result), now, issue_id, volume_code),
                 )
 
+            self._revalidate_index_after_change(conn, issue_id, roster, now)
+
             conn.execute("COMMIT")
         except (
             coverage.ArrangementError,
@@ -292,6 +481,7 @@ class Store:
             "issue_created": issue_created,
             "roster_changed": roster_changed,
             "recomputed_volume_codes": recomputed,
+            "delivery_index_status": self.get_delivery_index_status(issue_id),
             "volume": _volume_view(
                 {
                     "volume_code": volume_code,
@@ -332,8 +522,9 @@ class Store:
         try:
             rows = conn.execute(
                 "SELECT i.issue_id, i.plates_json, i.created_at, i.updated_at, "
-                "       COUNT(v.id) AS volume_count "
+                "       COUNT(v.id) AS volume_count, d.status AS delivery_status "
                 "FROM issues i LEFT JOIN volumes v ON v.issue_id = i.issue_id "
+                "LEFT JOIN delivery_indexes d ON d.issue_id = i.issue_id "
                 "GROUP BY i.issue_id ORDER BY i.issue_id"
             ).fetchall()
             return [
@@ -341,6 +532,7 @@ class Store:
                     "issue_id": row["issue_id"],
                     "plate_count": len(json.loads(row["plates_json"])),
                     "volume_count": row["volume_count"],
+                    "delivery_index_status": row["delivery_status"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                 }

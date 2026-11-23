@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 MAX_FRAMES_PER_VOLUME = 500
 
@@ -181,29 +181,15 @@ def _is_feasible_without_page(
     return True
 
 
-def compute_volume(
+def _prepare_volume(
     roster: Sequence[str],
     frames: Sequence[Frame],
     *,
     max_frames: int = MAX_FRAMES_PER_VOLUME,
 ) -> dict[str, Any]:
-    """计算单卷结果。
+    """校验一卷数据并构造逐帧允许版序的位图（含漏扫帧）。
 
-    返回::
-
-        {
-          "feasible": True,
-          "span": {...},
-          "pages": {
-             "<版号>": {
-                "possible_scanned_frames": [...],
-                "possible_missed_frames": [...],
-                "guaranteed": bool,
-             }, ...
-          }
-        }
-
-    任何不合法/排不通的情况都会抛出 :class:`ArrangementError`。
+    这是 :func:`compute_volume` 与 :func:`feasible_with_picks` 共用的前置步骤。
     """
 
     roster = list(roster)
@@ -258,6 +244,90 @@ def compute_volume(
                 f"原帧 {frame.frame_no} 没有有效候选版号", "no_candidate"
             )
         allowed.append(mask)
+
+    return {
+        "roster": roster,
+        "plate_index": plate_index,
+        "all_mask": all_mask,
+        "first": first,
+        "last": last,
+        "span": span,
+        "scanned_by_pos": scanned_by_pos,
+        "allowed": allowed,
+    }
+
+
+def feasible_with_picks(
+    roster: Sequence[str],
+    frames: Sequence[Frame],
+    picks: Mapping[int, str],
+    *,
+    max_frames: int = MAX_FRAMES_PER_VOLUME,
+) -> bool:
+    """所选帧能否在同一套合法排法里同时落到各自的指定版。
+
+    ``picks`` 是 ``{原帧号: 版号}``。每一帧都必须是本卷的已扫帧。只要存在
+    一条排法让所有被选中的帧同时落在指定版上即返回 ``True``。
+
+    额度/格式不合法仍抛 :class:`ArrangementError`；只是排不通则返回 ``False``。
+    """
+
+    prepared = _prepare_volume(roster, frames, max_frames=max_frames)
+    plate_index = prepared["plate_index"]
+    allowed = prepared["allowed"]
+    scanned_by_pos = prepared["scanned_by_pos"]
+    first = prepared["first"]
+
+    for frame_no, plate in picks.items():
+        if plate not in plate_index:
+            return False
+        if frame_no not in {first + pos for pos in scanned_by_pos}:
+            return False
+        pos = frame_no - first
+        if pos < 0 or pos >= len(allowed):
+            return False
+        bit = 1 << (plate_index[plate] - 1)
+        allowed[pos] &= bit
+        if not allowed[pos]:
+            return False
+
+    return _prefix_reachable(allowed, prepared["all_mask"]) is not None
+
+
+def compute_volume(
+    roster: Sequence[str],
+    frames: Sequence[Frame],
+    *,
+    max_frames: int = MAX_FRAMES_PER_VOLUME,
+) -> dict[str, Any]:
+    """计算单卷结果。
+
+    返回::
+
+        {
+          "feasible": True,
+          "span": {...},
+          "pages": {
+             "<版号>": {
+                "possible_scanned_frames": [...],
+                "possible_missed_frames": [...],
+                "guaranteed": bool,
+             }, ...
+          }
+        }
+
+    任何不合法/排不通的情况都会抛出 :class:`ArrangementError`。
+    """
+
+    prepared = _prepare_volume(roster, frames, max_frames=max_frames)
+    roster = prepared["roster"]
+    page_count = len(roster)
+    all_mask = prepared["all_mask"]
+    first = prepared["first"]
+    last = prepared["last"]
+    span = prepared["span"]
+    scanned_by_pos = prepared["scanned_by_pos"]
+    allowed = prepared["allowed"]
 
     forward = _prefix_reachable(allowed, all_mask)
     if forward is None:

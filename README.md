@@ -58,6 +58,53 @@ curl -X PUT localhost:8000/issues/2026-11-22/plates \
 - 排不通或写库失败，**整次提交回滚**，沿用原数据（错误响应里
   `error.data_unchanged` 为 `true`）。
 
+## 交档索引
+
+核查通过后，档案员按期提交一份**逐版取图索引**：每个版号对应一个
+`(卷号, 原帧号)`，作为数字档的取图依据。
+
+```bash
+curl -X PUT localhost:8000/issues/2026-11-22/delivery-index \
+  -H 'content-type: application/json' -d '{
+    "entries": [
+      {"plate": "1", "volume_code": "V01", "frame_no": 1001},
+      {"plate": "2", "volume_code": "V01", "frame_no": 1002},
+      {"plate": "3", "volume_code": "V02", "frame_no": 1},
+      {"plate": "4", "volume_code": "V02", "frame_no": 2}
+    ]
+  }'
+
+curl localhost:8000/issues/2026-11-22/delivery-index   # 按期查
+curl localhost:8000/delivery-indexes                  # 各期索引一览
+```
+
+请求体也接受条目列表、`{"版号": {"volume_code": ..., "frame_no": ...}}`
+映射、`{"版号": "V01:1001"}` 紧凑写法，以及 `plate`/`page`、
+`volume_code`/`volume`、`frame_no`/`frame` 等字段别名。
+
+核定条件：
+
+- 覆盖该期**全部版号**，且每版**恰好一条**；
+- 所选原帧必须是该卷已提交的**已扫帧**；
+- **同一卷的同一原帧不得挂到两版**；
+- 对同一卷，所有被选中的帧必须能在**同一套合法排法**里同时拍到指定版。
+
+核定通过后整期替换旧索引，按 `GET /issues/{id}/delivery-index` 可查
+（`status: approved`、`serving: true`）。
+
+### 数据变更后的复检
+
+换卷（重新提交任一卷）或更换全期清单时，用**更新后的数据**重新校验原索引：
+
+| 结果 | 处理 |
+| --- | --- |
+| 仍满足核定条件 | 原样继续供档（`approved`） |
+| 不再满足 | 随这次变更撤下（`status: withdrawn`，`reason` 说明原因） |
+
+撤下是**粘性**的：即使随后把数据改回去，也不会自动恢复供档，必须重新
+核定（再 `PUT` 一次）。若本次变更本身失败（排不通或写库失败），整个事务
+回滚，原核查数据与索引状态都不变。
+
 ## 核查
 
 ```bash
@@ -94,6 +141,9 @@ curl localhost:8000/issues/2026-11-22/volumes         # 各卷排法结果
 | GET | `/issues/{issue_id}/volumes/{volume_code}` | 单卷结果 |
 | GET | `/issues/{issue_id}/plates` | 按期查各版 |
 | GET | `/issues/{issue_id}/plates/{plate}` | 单版结论 |
+| PUT | `/issues/{issue_id}/delivery-index` | 提交并核定交档索引（整期替换） |
+| GET | `/issues/{issue_id}/delivery-index` | 按期查交档索引 |
+| GET | `/delivery-indexes` | 各期交档索引一览 |
 
 错误统一为 `{"error": {"code": ..., "message": ...}}`；数据校验/排不通
 返回 422，存储失败返回 503，均带 `data_unchanged: true`。

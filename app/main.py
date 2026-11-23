@@ -6,13 +6,19 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import checking, coverage
-from .db import MissingRosterError, StorageError, Store, volume_view
+from .db import (
+    MissingIssueError,
+    MissingRosterError,
+    StorageError,
+    Store,
+    volume_view,
+)
 
 
 DEFAULT_DB_PATH = os.environ.get("NEWSPAPER_DB", "data/checker.db")
@@ -85,6 +91,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def handle_missing_roster(request: Request, exc: MissingRosterError):
         return _error(422, "missing_roster", exc.message, data_unchanged=True)
 
+    @app.exception_handler(MissingIssueError)
+    async def handle_missing_issue(request: Request, exc: MissingIssueError):
+        return _error(404, "unknown_issue", exc.message, data_unchanged=True)
+
     @app.exception_handler(StorageError)
     async def handle_storage_error(request: Request, exc: StorageError):
         return _error(503, "storage_error", exc.message, data_unchanged=True)
@@ -111,10 +121,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
         issue = store.get_issue(issue_id)
         if issue is None:
             raise HTTPException(status_code=404, detail="该期尚未登记")
+        delivery_index = store.get_delivery_index(issue_id)
         return {
             "issue_id": issue["issue_id"],
             "plates": issue["plates"],
             "volume_count": len(store.get_volumes(issue_id)),
+            "delivery_index_status": (
+                None if delivery_index is None else delivery_index["status"]
+            ),
             "updated_at": issue["updated_at"],
         }
 
@@ -147,6 +161,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "issue_created": summary["issue_created"],
             "roster_changed": summary["roster_changed"],
             "recomputed_volume_codes": summary["recomputed_volume_codes"],
+            "delivery_index_status": summary.get("delivery_index_status"),
             "volume": summary["volume"],
         }
 
@@ -169,6 +184,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="该期尚未登记")
             raise HTTPException(status_code=404, detail="该卷尚未提交")
         return {"issue_id": issue_id, **volume_view(volume)}
+
+    # -- 交档索引 -----------------------------------------------------------
+
+    @app.put("/issues/{issue_id}/delivery-index", tags=["交档"])
+    def set_delivery_index(
+        issue_id: str,
+        request: Request,
+        payload: Any = Body(...),
+    ) -> dict[str, Any]:
+        """提交并核定该期的交档索引，通过后整期替换旧索引。
+
+        请求体可以是 ``{"entries": [...]}``、条目列表，或
+        ``{"版号": {"volume_code": ..., "frame_no": ...}}`` 映射；条目字段也
+        接受 ``plate``/``page``、``volume_code``/``volume``、``frame_no``/``frame``
+        等别名。核定失败不写入任何数据，原索引与核查数据保持不变。
+        """
+
+        return current_store(request).approve_delivery_index(issue_id, payload)
+
+    @app.get("/issues/{issue_id}/delivery-index", tags=["交档"])
+    def get_delivery_index(issue_id: str, request: Request) -> dict[str, Any]:
+        """按期查交档索引；已撤下的索引带 ``status`` 与 ``reason``。"""
+
+        store = current_store(request)
+        if store.get_issue(issue_id) is None:
+            raise HTTPException(status_code=404, detail="该期尚未登记")
+        result = store.get_delivery_index(issue_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="该期尚未核定交档索引")
+        return result
+
+    @app.get("/delivery-indexes", tags=["交档"])
+    def list_delivery_indexes(request: Request) -> dict[str, Any]:
+        return {"indexes": current_store(request).list_delivery_indexes()}
 
     # -- 核查 ---------------------------------------------------------------
 
